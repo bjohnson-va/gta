@@ -42,10 +42,14 @@ func main() {
 		key, opts.estimateMs,
 	)
 
+	envVars, execArgs := splitEnvVars(opts.cmdArgs)
 	cmd := exec.Command(
-		opts.cmdArgs[0], opts.cmdArgs[1:]...,
+		execArgs[0], execArgs[1:]...,
 	)
 	cmd.Stdin = os.Stdin
+	if len(envVars) > 0 {
+		cmd.Env = append(os.Environ(), envVars...)
+	}
 	// Put child in its own process group so we can
 	// forward signals cleanly.
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -326,9 +330,13 @@ func buildKey(
 	return cwd + "\x00" + normalized
 }
 
-// normalizeCommand strips leading VAR=VALUE env
-// assignments and joins the remaining args.
-func normalizeCommand(args []string) string {
+// splitEnvVars separates leading VAR=VALUE assignments
+// from the actual command. exec.Command can't handle
+// inline env vars the way a shell does — they need to
+// be set via cmd.Env instead.
+func splitEnvVars(
+	args []string,
+) (envVars []string, cmdArgs []string) {
 	i := 0
 	for i < len(args) {
 		if looksLikeEnvVar(args[i]) {
@@ -337,7 +345,14 @@ func normalizeCommand(args []string) string {
 		}
 		break
 	}
-	return strings.Join(args[i:], " ")
+	return args[:i], args[i:]
+}
+
+// normalizeCommand strips leading VAR=VALUE env
+// assignments and joins the remaining args.
+func normalizeCommand(args []string) string {
+	_, cmd := splitEnvVars(args)
+	return strings.Join(cmd, " ")
 }
 
 // looksLikeEnvVar returns true for strings like
