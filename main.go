@@ -52,11 +52,11 @@ func main() {
 		Setpgid: true,
 	}
 
-	// Set up output interception for quiescence
-	// detection. We pipe stdout and stderr through
-	// writers that track the last output time.
+	// Pipe stdout/stderr through gta to track output
+	// timing and volume for quiescence detection.
 	var lastOutput atomic.Int64
 	lastOutput.Store(time.Now().UnixMilli())
+	var totalBytes atomic.Int64
 
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -86,11 +86,17 @@ func main() {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		relay(stdoutPipe, os.Stdout, &lastOutput)
+		relay(
+			stdoutPipe, os.Stdout,
+			&lastOutput, &totalBytes,
+		)
 	}()
 	go func() {
 		defer wg.Done()
-		relay(stderrPipe, os.Stderr, &lastOutput)
+		relay(
+			stderrPipe, os.Stderr,
+			&lastOutput, &totalBytes,
+		)
 	}()
 
 	// Forward signals to the child process group.
@@ -119,17 +125,13 @@ func main() {
 		quietTimeout = defaultQuietTimeout
 	}
 
-	// Quiescence fires only after the process has run
-	// long enough that a gap in output is meaningful.
-	// Before the estimate (or 30s with no estimate),
-	// gaps are normal (e.g. a build tool printing
-	// "Building..." then going silent while compiling).
-	minRunBeforeQuiet := time.Duration(
-		estimateMs,
-	) * time.Millisecond
-	if minRunBeforeQuiet == 0 {
-		minRunBeforeQuiet = 30 * time.Second
-	}
+	// Quiescence fires when enough output has been
+	// produced (indicating real work happened) and
+	// then output goes quiet. 256 bytes is well past
+	// a single status line ("Building..." ~20 bytes)
+	// but catches even minimal completion output
+	// (a single error + "Watch mode enabled").
+	const minBytesBeforeQuiet int64 = 256
 
 	quietCheck := time.NewTicker(500 * time.Millisecond)
 	defer quietCheck.Stop()
@@ -144,8 +146,7 @@ func main() {
 			goto finished
 
 		case <-quietCheck.C:
-			elapsed := time.Since(start)
-			if elapsed < minRunBeforeQuiet {
+			if totalBytes.Load() < minBytesBeforeQuiet {
 				continue
 			}
 			last := lastOutput.Load()
@@ -207,6 +208,7 @@ func relay(
 	r io.Reader,
 	w io.Writer,
 	lastOutput *atomic.Int64,
+	totalBytes *atomic.Int64,
 ) {
 	buf := make([]byte, 4096)
 	for {
@@ -215,6 +217,7 @@ func relay(
 			lastOutput.Store(
 				time.Now().UnixMilli(),
 			)
+			totalBytes.Add(int64(n))
 			_, _ = w.Write(buf[:n])
 		}
 		if err != nil {
