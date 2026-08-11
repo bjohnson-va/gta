@@ -13,16 +13,14 @@ func TestParseArgs(t *testing.T) {
 		wantCmd   []string
 	}{
 		{
-			name:      "bare command after double dash",
-			args:      []string{"--", "npm", "ci"},
-			wantLabel: "",
-			wantCmd:   []string{"npm", "ci"},
+			name:    "bare command after double dash",
+			args:    []string{"--", "npm", "ci"},
+			wantCmd: []string{"npm", "ci"},
 		},
 		{
-			name:      "bare command without double dash",
-			args:      []string{"npm", "ci"},
-			wantLabel: "",
-			wantCmd:   []string{"npm", "ci"},
+			name:    "bare command without double dash",
+			args:    []string{"npm", "ci"},
+			wantCmd: []string{"npm", "ci"},
 		},
 		{
 			name:      "label with space-separated value",
@@ -37,7 +35,7 @@ func TestParseArgs(t *testing.T) {
 			wantCmd:   []string{"make"},
 		},
 		{
-			name:      "estimate parses duration string",
+			name:      "estimate parses duration",
 			args:      []string{"--estimate", "30s", "--", "npm", "ci"},
 			wantEstMs: 30000,
 			wantCmd:   []string{"npm", "ci"},
@@ -49,9 +47,8 @@ func TestParseArgs(t *testing.T) {
 			wantCmd:   []string{"npm", "ci"},
 		},
 		{
-			name:    "no args yields nil command",
-			args:    []string{},
-			wantCmd: nil,
+			name: "no args yields nil command",
+			args: []string{},
 		},
 		{
 			name: "label and estimate together",
@@ -68,23 +65,25 @@ func TestParseArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			label, estMs, cmd := parseArgs(tt.args)
-			if label != tt.wantLabel {
+			opts := parseArgs(tt.args)
+			if opts.label != tt.wantLabel {
 				t.Errorf(
 					"label = %q, want %q",
-					label, tt.wantLabel,
+					opts.label, tt.wantLabel,
 				)
 			}
-			if estMs != tt.wantEstMs {
+			if opts.estimateMs != tt.wantEstMs {
 				t.Errorf(
 					"estimateMs = %d, want %d",
-					estMs, tt.wantEstMs,
+					opts.estimateMs, tt.wantEstMs,
 				)
 			}
-			if !slicesEqual(cmd, tt.wantCmd) {
+			if !slicesEqual(
+				opts.cmdArgs, tt.wantCmd,
+			) {
 				t.Errorf(
 					"cmd = %v, want %v",
-					cmd, tt.wantCmd,
+					opts.cmdArgs, tt.wantCmd,
 				)
 			}
 		})

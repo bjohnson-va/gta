@@ -10,35 +10,66 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
 )
 
+// Default quiescence timeout: if the process is still
+// running and no output has been seen for this long,
+// declare it "ready" and record the timing.
+const defaultQuietTimeout = 5 * time.Second
+
 func main() {
 	args := os.Args[1:]
-	label, estimate, cmdArgs := parseArgs(args)
+	opts := parseArgs(args)
 
-	if len(cmdArgs) == 0 {
+	if len(opts.cmdArgs) == 0 {
 		printUsage()
 		os.Exit(1)
 	}
 
-	key := buildKey(label, cmdArgs)
+	key := buildKey(opts.label, opts.cmdArgs)
 	store := newTimingStore()
-	estimateMs := store.loadEstimate(key, estimate)
+	estimateMs := store.loadEstimate(
+		key, opts.estimateMs,
+	)
 
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd := exec.Command(
+		opts.cmdArgs[0], opts.cmdArgs[1:]...,
+	)
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 	// Put child in its own process group so we can
 	// forward signals cleanly.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+
+	// Set up output interception for quiescence
+	// detection. We pipe stdout and stderr through
+	// writers that track the last output time.
+	var lastOutput atomic.Int64
+	lastOutput.Store(time.Now().UnixMilli())
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"gta: stdout pipe: %v\n", err)
+		os.Exit(1)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"gta: stderr pipe: %v\n", err)
+		os.Exit(1)
+	}
 
 	printAgentHint()
 
@@ -49,6 +80,18 @@ func main() {
 			"gta: failed to start command: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Relay child output while tracking timestamps.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		relay(stdoutPipe, os.Stdout, &lastOutput)
+	}()
+	go func() {
+		defer wg.Done()
+		relay(stderrPipe, os.Stderr, &lastOutput)
+	}()
 
 	// Forward signals to the child process group.
 	sigCh := make(chan os.Signal, 1)
@@ -61,72 +104,182 @@ func main() {
 		}
 	}()
 
-	// Progress rendering loop.
+	// Wait for process exit in the background.
 	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	go func() {
+		wg.Wait()
+		done <- cmd.Wait()
+	}()
 
 	ticker := newProgressTicker(estimateMs)
 	ticker.start(start)
 
-	var cmdErr error
-	select {
-	case cmdErr = <-done:
-		ticker.stop()
+	quietTimeout := opts.quietTimeout
+	if quietTimeout == 0 {
+		quietTimeout = defaultQuietTimeout
 	}
 
+	// Quiescence fires only after the process has run
+	// long enough that a gap in output is meaningful.
+	// Before the estimate (or 30s with no estimate),
+	// gaps are normal (e.g. a build tool printing
+	// "Building..." then going silent while compiling).
+	minRunBeforeQuiet := time.Duration(
+		estimateMs,
+	) * time.Millisecond
+	if minRunBeforeQuiet == 0 {
+		minRunBeforeQuiet = 30 * time.Second
+	}
+
+	quietCheck := time.NewTicker(500 * time.Millisecond)
+	defer quietCheck.Stop()
+
+	var cmdErr error
+	quiesced := false
+
+	for {
+		select {
+		case cmdErr = <-done:
+			ticker.stop()
+			goto finished
+
+		case <-quietCheck.C:
+			elapsed := time.Since(start)
+			if elapsed < minRunBeforeQuiet {
+				continue
+			}
+			last := lastOutput.Load()
+			sinceLast := time.Since(
+				time.UnixMilli(last),
+			)
+			if sinceLast >= quietTimeout {
+				ticker.stop()
+				quiesced = true
+				goto finished
+			}
+		}
+	}
+
+finished:
 	elapsed := time.Since(start)
 	elapsedMs := elapsed.Milliseconds()
 
 	clearProgressBar()
 
+	if quiesced {
+		fmt.Fprintf(os.Stderr,
+			"gta: ready in %s (process still running)\n",
+			formatDurationMs(elapsedMs))
+		store.saveEstimate(key, elapsedMs)
+		// Wait for the process to exit (or signal).
+		cmdErr = <-done
+		if cmdErr != nil {
+			if exitErr, ok :=
+				cmdErr.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if cmdErr != nil {
 		fmt.Fprintf(os.Stderr,
 			"gta: command failed after %s\n",
 			formatDurationMs(elapsedMs))
-		if exitErr, ok := cmdErr.(*exec.ExitError); ok {
+		if exitErr, ok :=
+			cmdErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
 		os.Exit(1)
 	}
 
 	fmt.Fprintf(os.Stderr,
-		"gta: done in %s\n", formatDurationMs(elapsedMs))
+		"gta: done in %s\n",
+		formatDurationMs(elapsedMs))
 	store.saveEstimate(key, elapsedMs)
 }
 
-// parseArgs extracts --label, --estimate, and the command
-// after --. Returns (label, estimateMs, cmdArgs).
-func parseArgs(
-	args []string,
-) (string, int64, []string) {
-	label := ""
-	var estimateMs int64
+// relay copies from r to w, updating lastOutput on
+// each read. This lets gta detect when output goes
+// quiet.
+func relay(
+	r io.Reader,
+	w io.Writer,
+	lastOutput *atomic.Int64,
+) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			lastOutput.Store(
+				time.Now().UnixMilli(),
+			)
+			_, _ = w.Write(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+type parsedOpts struct {
+	label        string
+	estimateMs   int64
+	quietTimeout time.Duration
+	cmdArgs      []string
+}
+
+// parseArgs extracts --label, --estimate,
+// --quiet-timeout, and the command after --.
+func parseArgs(args []string) parsedOpts {
+	opts := parsedOpts{}
 
 	i := 0
 	for i < len(args) {
 		switch {
 		case args[i] == "--":
-			return label, estimateMs, args[i+1:]
+			opts.cmdArgs = args[i+1:]
+			return opts
 
-		case args[i] == "--label" && i+1 < len(args):
-			label = args[i+1]
+		case args[i] == "--label" &&
+			i+1 < len(args):
+			opts.label = args[i+1]
 			i += 2
 
 		case strings.HasPrefix(args[i], "--label="):
-			label = strings.TrimPrefix(
+			opts.label = strings.TrimPrefix(
 				args[i], "--label=")
 			i++
 
 		case args[i] == "--estimate" &&
 			i+1 < len(args):
-			estimateMs = parseDuration(args[i+1])
+			opts.estimateMs = parseDuration(args[i+1])
 			i += 2
 
 		case strings.HasPrefix(
 			args[i], "--estimate="):
-			estimateMs = parseDuration(
+			opts.estimateMs = parseDuration(
 				strings.TrimPrefix(
 					args[i], "--estimate="))
+			i++
+
+		case args[i] == "--quiet-timeout" &&
+			i+1 < len(args):
+			d, err := time.ParseDuration(args[i+1])
+			if err == nil {
+				opts.quietTimeout = d
+			}
+			i += 2
+
+		case strings.HasPrefix(
+			args[i], "--quiet-timeout="):
+			d, err := time.ParseDuration(
+				strings.TrimPrefix(
+					args[i], "--quiet-timeout="))
+			if err == nil {
+				opts.quietTimeout = d
+			}
 			i++
 
 		case args[i] == "--help" || args[i] == "-h":
@@ -134,11 +287,11 @@ func parseArgs(
 			os.Exit(0)
 
 		default:
-			// Everything from here on is the command.
-			return label, estimateMs, args[i:]
+			opts.cmdArgs = args[i:]
+			return opts
 		}
 	}
-	return label, estimateMs, nil
+	return opts
 }
 
 // parseDuration parses "30s", "2m", "90" (seconds).
@@ -149,7 +302,9 @@ func parseDuration(s string) int64 {
 	}
 	// Try bare number as seconds.
 	var secs float64
-	if _, err := fmt.Sscanf(s, "%f", &secs); err == nil {
+	if _, err := fmt.Sscanf(
+		s, "%f", &secs,
+	); err == nil {
 		return int64(secs * 1000)
 	}
 	return 0
@@ -157,7 +312,9 @@ func parseDuration(s string) int64 {
 
 // buildKey creates a timing key from the label or from
 // (cwd, normalized command).
-func buildKey(label string, cmdArgs []string) string {
+func buildKey(
+	label string, cmdArgs []string,
+) string {
 	if label != "" {
 		return label
 	}
@@ -201,17 +358,21 @@ func looksLikeEnvVar(s string) bool {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `gta — guesstimated time of arrival
+	fmt.Fprintf(os.Stderr,
+		`gta — guesstimated time of arrival
 
 Usage:
   gta [options] -- <command> [args...]
   gta [options] <command> [args...]
 
 Options:
-  --label <name>      Override the timing key
-  --estimate <dur>    Seed estimate for first run
-                      (e.g. 30s, 2m, 90)
-  -h, --help          Show this help
+  --label <name>        Override the timing key
+  --estimate <dur>      Seed estimate for first run
+                        (e.g. 30s, 2m, 90)
+  --quiet-timeout <dur> Quiescence timeout for
+                        long-running processes
+                        (default 5s)
+  -h, --help            Show this help
 
 Examples:
   gta -- npm ci
