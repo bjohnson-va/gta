@@ -22,10 +22,11 @@ func TestQuiescence_FiresAfterOutputBurstThenSilence(
 	// Quiescence fires after 2s of silence, then gta
 	// blocks on child exit — sleep must be short enough
 	// that the child exits within the test timeout.
+	// Output must exceed minBytesBeforeQuiet (4096).
 	cmd := exec.Command(binary,
 		"--quiet-timeout", "2s",
 		"--", "bash", "-c",
-		`for i in $(seq 1 20); do echo "line $i padding"; done; sleep 4`,
+		`for i in $(seq 1 300); do echo "line $i padding text to reach byte threshold"; done; sleep 4`,
 	)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
@@ -74,7 +75,7 @@ func TestQuiescence_DoesNotFireBelowByteThreshold(
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", dir)
 
-	// Emit < 256 bytes then go silent. Quiescence
+	// Emit < 4096 bytes then go silent. Quiescence
 	// should NOT fire — gta should keep waiting.
 	cmd := exec.Command(binary,
 		"--quiet-timeout", "1s",

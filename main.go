@@ -131,11 +131,12 @@ func main() {
 
 	// Quiescence fires when enough output has been
 	// produced (indicating real work happened) and
-	// then output goes quiet. 256 bytes is well past
-	// a single status line ("Building..." ~20 bytes)
-	// but catches even minimal completion output
-	// (a single error + "Watch mode enabled").
-	const minBytesBeforeQuiet int64 = 256
+	// then output goes quiet. 4096 bytes ensures a
+	// preamble of warnings (npm warn, deprecation
+	// notices) doesn't look like "done". Real build
+	// completion output (compilation results, ready
+	// messages) is typically well above this.
+	const minBytesBeforeQuiet int64 = 4096
 
 	quietCheck := time.NewTicker(500 * time.Millisecond)
 	defer quietCheck.Stop()
